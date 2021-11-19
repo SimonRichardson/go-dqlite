@@ -313,7 +313,7 @@ func (d *Driver) Open(uri string) (driver.Conn, error) {
 // SetContextTimeout sets the default client timeout when no context deadline
 // is provided.
 //
-// DEPRECATED: This API is no a no-op. Users should explicitly pass a context
+// DEPRECATED: This API is now a no-op. Users should explicitly pass a context
 // if they wish to cancel their requests, or use the WithContextTimeout option.
 func (d *Driver) SetContextTimeout(timeout time.Duration) {}
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io/ioutil"
@@ -11,9 +12,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/canonical/go-dqlite/app"
 	"github.com/canonical/go-dqlite/client"
+	"github.com/juju/pubsub"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
@@ -43,6 +46,12 @@ Complete documentation is available at https://github.com/canonical/go-dqlite`,
 				}
 				log.Printf(fmt.Sprintf("%s: %s: %s\n", api, l.String(), format), a...)
 			}
+
+			events := pubsub.NewSimpleHub(nil)
+			events.SubscribeMatch(pubsub.MatchAll, func(topic string, data interface{}) {
+				fmt.Println("!!", topic, data)
+			})
+
 			app, err := app.New(dir, app.WithAddress(db), app.WithCluster(*join), app.WithLogFunc(logFunc))
 			if err != nil {
 				return err
@@ -67,16 +76,64 @@ Complete documentation is available at https://github.com/canonical/go-dqlite`,
 				switch r.Method {
 				case "GET":
 					row := db.QueryRow(query, key)
-					if err := row.Scan(&result); err != nil {
+					var id int
+					var value string
+					if err := row.Scan(&id, &value); err != nil {
 						result = fmt.Sprintf("Error: %s", err.Error())
+						break
 					}
-					break
+					result = fmt.Sprintf("%d: %s", id, value)
+
 				case "PUT":
 					result = "done"
 					value, _ := ioutil.ReadAll(r.Body)
 					if _, err := db.Exec(update, key, value); err != nil {
 						result = fmt.Sprintf("Error: %s", err.Error())
 					}
+
+				case "POST": // Just for a test
+					rows, err := db.Query(wal)
+					if err != nil {
+						result = fmt.Sprintf("Error: %s", err.Error())
+						break
+					}
+					defer rows.Close()
+
+					var docs []struct {
+						t  string
+						id int
+						m  string
+					}
+					dest := func(i int) []interface{} {
+						docs = append(docs, struct {
+							t  string
+							id int
+							m  string
+						}{})
+						return []interface{}{
+							&docs[i].t,
+							&docs[i].id,
+							&docs[i].m,
+						}
+					}
+
+					for i := 0; rows.Next(); i++ {
+						if err := rows.Scan(dest(i)...); err != nil {
+							result = fmt.Sprintf("Error: %s", err.Error())
+							break
+						}
+					}
+
+					if result == "" {
+						buf := new(bytes.Buffer)
+						tab := tabwriter.NewWriter(buf, 2, 4, 2, '\t', 0)
+						for k, v := range docs {
+							fmt.Fprintf(tab, "%d\t%s\t%d\t%s\n", k, v.t, v.id, v.m)
+						}
+						tab.Flush()
+						result = buf.String()
+					}
+
 				default:
 					result = fmt.Sprintf("Error: unsupported method %q", r.Method)
 
@@ -91,7 +148,7 @@ Complete documentation is available at https://github.com/canonical/go-dqlite`,
 
 			go http.Serve(listener, nil)
 
-			ch := make(chan os.Signal)
+			ch := make(chan os.Signal, 1)
 			signal.Notify(ch, unix.SIGPWR)
 			signal.Notify(ch, unix.SIGINT)
 			signal.Notify(ch, unix.SIGQUIT)
@@ -125,7 +182,34 @@ Complete documentation is available at https://github.com/canonical/go-dqlite`,
 }
 
 const (
-	schema = "CREATE TABLE IF NOT EXISTS model (key TEXT, value TEXT, UNIQUE(key))"
-	query  = "SELECT value FROM model WHERE key = ?"
+	schema = `
+CREATE TABLE IF NOT EXISTS model (
+	id INTEGER PRIMARY KEY AUTOINCREMENT, 
+	key TEXT, 
+	value TEXT, 
+	UNIQUE(key)
+);
+	
+CREATE TABLE IF NOT EXISTS wal (
+	type TEXT, 
+	id INTEGER, 
+	method TEXT, 
+	created_at DATETIME
+);
+	
+CREATE TRIGGER IF NOT EXISTS insert_model_trigger
+AFTER INSERT ON model FOR EACH ROW
+BEGIN
+	INSERT INTO wal VALUES ("model", NEW.id, "insert", CURRENT_TIMESTAMP);
+END;
+
+CREATE TRIGGER IF NOT EXISTS update_model_trigger
+AFTER UPDATE ON model FOR EACH ROW
+BEGIN
+	INSERT INTO wal VALUES ("model", NEW.id, "update", CURRENT_TIMESTAMP);
+END;
+`
+	query  = "SELECT id, value FROM model WHERE key = ?"
 	update = "INSERT OR REPLACE INTO model(key, value) VALUES(?, ?)"
+	wal    = "SELECT type, id, method FROM wal"
 )
