@@ -40,7 +40,6 @@ type Driver struct {
 	connectionTimeout time.Duration    // Max time to wait for a new connection
 	contextTimeout    time.Duration    // Default client context timeout.
 	clientConfig      protocol.Config  // Configuration for dqlite client instances
-	tracing           client.LogLevel  // Whether to trace statements
 }
 
 // Error is returned in case of database errors.
@@ -169,14 +168,6 @@ func WithContextTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithTracing will emit a log message at the given level every time a
-// statement gets executed.
-func WithTracing(level client.LogLevel) Option {
-	return func(options *options) {
-		options.Tracing = level
-	}
-}
-
 // NewDriver creates a new dqlite driver, which also implements the
 // driver.Driver interface.
 func New(store client.NodeStore, options ...Option) (*Driver, error) {
@@ -192,7 +183,6 @@ func New(store client.NodeStore, options ...Option) (*Driver, error) {
 		context:           o.Context,
 		connectionTimeout: o.ConnectionTimeout,
 		contextTimeout:    o.ContextTimeout,
-		tracing:           o.Tracing,
 		clientConfig: protocol.Config{
 			Dial:           o.Dial,
 			AttemptTimeout: o.AttemptTimeout,
@@ -216,15 +206,13 @@ type options struct {
 	ConnectionBackoffCap    time.Duration
 	RetryLimit              uint
 	Context                 context.Context
-	Tracing                 client.LogLevel
 }
 
 // Create a options object with sane defaults.
 func defaultOptions() *options {
 	return &options{
-		Log:     client.DefaultLogFunc,
-		Dial:    client.DefaultDialFunc,
-		Tracing: client.LogNone,
+		Log:  client.DefaultLogFunc,
+		Dial: client.DefaultDialFunc,
 	}
 }
 
@@ -253,7 +241,6 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	conn := &Conn{
 		log:            c.driver.log,
 		contextTimeout: c.driver.contextTimeout,
-		tracing:        c.driver.tracing,
 	}
 
 	var err error
@@ -333,7 +320,6 @@ type Conn struct {
 	response       protocol.Message
 	id             uint32 // Database ID.
 	contextTimeout time.Duration
-	tracing        client.LogLevel
 }
 
 // PrepareContext returns a prepared statement, bound to this connection.
@@ -348,19 +334,12 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 		request:  &c.request,
 		response: &c.response,
 		log:      c.log,
-		tracing:  c.tracing,
+		sql:      query,
 	}
 
 	protocol.EncodePrepare(&c.request, uint64(c.id), query)
 
-	var start time.Time
-	if c.tracing != client.LogNone {
-		start = time.Now()
-	}
 	err := c.protocol.Call(ctx, &c.request, &c.response)
-	if c.tracing != client.LogNone {
-		c.log(c.tracing, "%.3fs request prepared: %q", time.Since(start).Seconds(), query)
-	}
 	if err != nil {
 		return nil, driverError(c.log, err)
 	}
@@ -368,10 +347,6 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	stmt.db, stmt.id, stmt.params, err = protocol.DecodeStmt(&c.response)
 	if err != nil {
 		return nil, driverError(c.log, err)
-	}
-
-	if c.tracing != client.LogNone {
-		stmt.sql = query
 	}
 
 	return stmt, nil
@@ -395,14 +370,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 		protocol.EncodeExecSQLV0(&c.request, uint64(c.id), query, args)
 	}
 
-	var start time.Time
-	if c.tracing != client.LogNone {
-		start = time.Now()
-	}
 	err := c.protocol.Call(ctx, &c.request, &c.response)
-	if c.tracing != client.LogNone {
-		c.log(c.tracing, "%.3fs request exec: %q", time.Since(start).Seconds(), query)
-	}
 	if err != nil {
 		return nil, driverError(c.log, err)
 	}
@@ -434,14 +402,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 		protocol.EncodeQuerySQLV0(&c.request, uint64(c.id), query, args)
 	}
 
-	var start time.Time
-	if c.tracing != client.LogNone {
-		start = time.Now()
-	}
 	err := c.protocol.Call(ctx, &c.request, &c.response)
-	if c.tracing != client.LogNone {
-		c.log(c.tracing, "%.3fs request query: %q", time.Since(start).Seconds(), query)
-	}
 	if err != nil {
 		return nil, driverError(c.log, err)
 	}
@@ -556,7 +517,6 @@ type Stmt struct {
 	params   uint64
 	log      client.LogFunc
 	sql      string // Prepared SQL, only set when tracing
-	tracing  client.LogLevel
 }
 
 // Close closes the statement.
@@ -597,14 +557,7 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 		protocol.EncodeExecV0(s.request, s.db, s.id, args)
 	}
 
-	var start time.Time
-	if s.tracing != client.LogNone {
-		start = time.Now()
-	}
 	err := s.protocol.Call(ctx, s.request, s.response)
-	if s.tracing != client.LogNone {
-		s.log(s.tracing, "%.3fs request prepared: %q", time.Since(start).Seconds(), s.sql)
-	}
 	if err != nil {
 		return nil, driverError(s.log, err)
 	}
@@ -639,14 +592,7 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 		protocol.EncodeQueryV0(s.request, s.db, s.id, args)
 	}
 
-	var start time.Time
-	if s.tracing != client.LogNone {
-		start = time.Now()
-	}
 	err := s.protocol.Call(ctx, s.request, s.response)
-	if s.tracing != client.LogNone {
-		s.log(s.tracing, "%.3fs request prepared: %q", time.Since(start).Seconds(), s.sql)
-	}
 	if err != nil {
 		return nil, driverError(s.log, err)
 	}
