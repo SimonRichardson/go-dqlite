@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	sqldriver "database/sql/driver"
 	"fmt"
 	"net"
 	"os"
@@ -40,7 +41,6 @@ type App struct {
 	tls             *tlsSetup
 	dialFunc        client.DialFunc
 	store           client.NodeStore
-	driver          *driver.Driver
 	driverName      string
 	log             client.LogFunc
 	ctx             context.Context
@@ -214,18 +214,24 @@ func New(dir string, options ...Option) (app *App, err error) {
 		driverDial = o.Conn.dialFunc
 	}
 
-	driver, err := driver.New(
+	drv, err := driver.New(
 		store,
 		driver.WithDialFunc(driverDial),
 		driver.WithLogFunc(o.Log),
-		driver.WithTracing(o.Tracing),
 	)
 	if err != nil {
 		stop()
 		return nil, fmt.Errorf("create driver: %w", err)
 	}
 	driverName := fmt.Sprintf("dqlite-%d", atomic.AddInt64(&driverIndex, 1))
-	sql.Register(driverName, driver)
+
+	var sqlDriver sqldriver.Driver
+	if o.Tracing != client.LogNone {
+		sqlDriver = driver.NewLogTracingDriver(drv, o.Log, o.Tracing)
+	} else {
+		sqlDriver = drv
+	}
+	sql.Register(driverName, sqlDriver)
 
 	if o.Voters < 3 || o.Voters%2 == 0 {
 		stop()
@@ -245,7 +251,6 @@ func New(dir string, options ...Option) (app *App, err error) {
 		nodeBindAddress: nodeBindAddress,
 		store:           store,
 		dialFunc:        driverDial,
-		driver:          driver,
 		driverName:      driverName,
 		log:             o.Log,
 		tls:             o.TLS,

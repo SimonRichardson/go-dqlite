@@ -1292,8 +1292,8 @@ func Test_TxRowsAffected(t *testing.T) {
 CREATE TABLE test (
 	id            TEXT PRIMARY KEY,
 	value         INT
-);`);
-	require.NoError(t, err);
+);`)
+	require.NoError(t, err)
 
 	// Insert watermark
 	err = tx(context.Background(), db, func(ctx context.Context, tx *sql.Tx) error {
