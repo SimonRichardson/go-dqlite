@@ -43,7 +43,7 @@ func BenchmarkStmtCache_Put(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				cache := NewStmtCache(bm.capacity)
+				cache := newStmtCache(bm.capacity)
 				for j := 0; j < bm.queries; j++ {
 					cache.Put(queries[j], stmts[j])
 				}
@@ -66,7 +66,7 @@ func BenchmarkStmtCache_TryGet_Hit(b *testing.B) {
 
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
-			cache := NewStmtCache(bm.capacity)
+			cache := newStmtCache(bm.capacity)
 			queries := make([]string, bm.queries)
 			for i := 0; i < bm.queries; i++ {
 				queries[i] = fmt.Sprintf("SELECT * FROM table_%d WHERE id = ?", i)
@@ -96,7 +96,7 @@ func BenchmarkStmtCache_TryGet_Miss(b *testing.B) {
 
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
-			cache := NewStmtCache(bm.capacity)
+			cache := newStmtCache(bm.capacity)
 			for i := 0; i < bm.cached; i++ {
 				query := fmt.Sprintf("SELECT * FROM table_%d WHERE id = ?", i)
 				cache.Put(query, &Stmt{})
@@ -115,7 +115,7 @@ func BenchmarkStmtCache_TryGet_Miss(b *testing.B) {
 
 // BenchmarkStmtCache_TryGet_PrefixMatch measures prefix matching performance
 func BenchmarkStmtCache_TryGet_PrefixMatch(b *testing.B) {
-	cache := NewStmtCache(100)
+	cache := newStmtCache(100)
 
 	// Populate with common SQL statements
 	statements := []string{
@@ -154,7 +154,7 @@ func BenchmarkStmtCache_TryGet_PrefixMatch(b *testing.B) {
 
 // BenchmarkStmtCache_TryGet_LongestPrefix measures performance when multiple prefixes match
 func BenchmarkStmtCache_TryGet_LongestPrefix(b *testing.B) {
-	cache := NewStmtCache(50)
+	cache := newStmtCache(50)
 
 	// Create overlapping prefixes
 	cache.Put("SELECT", &Stmt{})
@@ -175,7 +175,7 @@ func BenchmarkStmtCache_TryGet_LongestPrefix(b *testing.B) {
 
 // BenchmarkStmtCache_Mixed measures realistic mixed workload
 func BenchmarkStmtCache_Mixed(b *testing.B) {
-	cache := NewStmtCache(50)
+	cache := newStmtCache(50)
 
 	queries := []string{
 		"BEGIN",
@@ -206,7 +206,7 @@ func BenchmarkStmtCache_Mixed(b *testing.B) {
 
 // BenchmarkStmtCache_LRU measures LRU eviction overhead
 func BenchmarkStmtCache_LRU(b *testing.B) {
-	cache := NewStmtCache(10)
+	cache := newStmtCache(10)
 
 	// Pre-fill cache
 	for i := 0; i < 10; i++ {
@@ -224,7 +224,7 @@ func BenchmarkStmtCache_LRU(b *testing.B) {
 
 // BenchmarkStmtCache_Whitespace measures impact of whitespace variations
 func BenchmarkStmtCache_Whitespace(b *testing.B) {
-	cache := NewStmtCache(10)
+	cache := newStmtCache(10)
 	cache.Put("SELECT 1", &Stmt{})
 
 	queries := []string{
@@ -247,7 +247,7 @@ func BenchmarkStmtCache_Whitespace(b *testing.B) {
 // BenchmarkStmtCache_RealWorld simulates a realistic database workload
 func BenchmarkStmtCache_RealWorld(b *testing.B) {
 	// Simulate a web application with common query patterns
-	cache := NewStmtCache(100)
+	cache := newStmtCache(100)
 
 	// Common queries that would be in the cache
 	commonQueries := []string{

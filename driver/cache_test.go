@@ -17,7 +17,7 @@ package driver
 import "testing"
 
 func TestStmtCache_TryGet(t *testing.T) {
-	cache := NewStmtCache(10)
+	cache := newStmtCache(10)
 
 	// Create mock statements
 	beginStmt := &Stmt{}
@@ -109,7 +109,7 @@ func TestStmtCache_TryGet(t *testing.T) {
 }
 
 func TestStmtCache_LRU(t *testing.T) {
-	cache := NewStmtCache(2)
+	cache := newStmtCache(2)
 
 	stmt1 := &Stmt{}
 	stmt2 := &Stmt{}
@@ -143,7 +143,7 @@ func TestStmtCache_LRU(t *testing.T) {
 }
 
 func TestStmtCache_EdgeCases(t *testing.T) {
-	cache := NewStmtCache(20)
+	cache := newStmtCache(20)
 
 	// Prepare various strange SQLite statements
 	stmts := make(map[string]*Stmt)
@@ -493,7 +493,7 @@ func TestStmtCache_EdgeCases(t *testing.T) {
 
 func TestStmtCache_LongestPrefix(t *testing.T) {
 	// Test that longest prefix is selected when multiple matches exist
-	cache := NewStmtCache(10)
+	cache := newStmtCache(10)
 
 	stmt1 := &Stmt{}
 	stmt2 := &Stmt{}
@@ -541,7 +541,7 @@ func TestStmtCache_LongestPrefix(t *testing.T) {
 }
 
 func TestStmtCache_PutExistingEntryMovesToFront(t *testing.T) {
-	cache := NewStmtCache(2)
+	cache := newStmtCache(2)
 
 	stmt1 := &Stmt{}
 	stmt2 := &Stmt{}
@@ -576,7 +576,7 @@ func TestStmtCache_PutExistingEntryMovesToFront(t *testing.T) {
 }
 
 func TestStmtCache_EvictEdgeCases(t *testing.T) {
-	cache := NewStmtCache(1)
+	cache := newStmtCache(1)
 
 	// Empty cache eviction should be a no-op.
 	cache.evict()
@@ -597,7 +597,7 @@ func TestStmtCache_EvictEdgeCases(t *testing.T) {
 }
 
 func TestStmtCache_MultilineQuery(t *testing.T) {
-	cache := NewStmtCache(10)
+	cache := newStmtCache(10)
 	stmt := &Stmt{}
 
 	multilineQuery := "SELECT id,\n       name\nFROM users\nWHERE id = ?"

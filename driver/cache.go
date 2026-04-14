@@ -21,6 +21,33 @@ import (
 	"github.com/tidwall/btree"
 )
 
+// Cache is an interface for caching prepared statements.
+type PreparedStatementCache interface {
+	// Put adds a new statement to the cache.
+	Put(query string, stmt *Stmt)
+
+	// TryGet retrieves a statement from the cache based on the query. If the
+	// statement is found, it is returned along with the number of characters
+	// matched from the query. If the statement is not found, nil is returned.
+	TryGet(query string) (*Stmt, int)
+
+	// Close releases all resources associated with the cache.
+	Close()
+}
+
+type noopCache struct{}
+
+// Put does nothing, as this is a no-op cache.
+func (c *noopCache) Put(query string, stmt *Stmt) {}
+
+// TryGet always returns nil, as this is a no-op cache.
+func (c *noopCache) TryGet(query string) (*Stmt, int) {
+	return nil, 0
+}
+
+// Close does nothing, as this is a no-op cache.
+func (c *noopCache) Close() {}
+
 // cacheEntry represents a single entry in the cache.
 type cacheEntry struct {
 	// query is the original query string that was executed.
@@ -32,8 +59,8 @@ type cacheEntry struct {
 	prev, next *cacheEntry
 }
 
-// StmtCache is a simple LRU cache for prepared statements.
-type StmtCache struct {
+// stmtCache is a simple LRU cache for prepared statements.
+type stmtCache struct {
 	// capacity is the maximum number of entries the cache can hold.
 	capacity int
 	// btree is a ordered tree for efficient prefix matching of queries.
@@ -42,9 +69,9 @@ type StmtCache struct {
 	head, tail *cacheEntry
 }
 
-// NewStmtCache creates a new StmtCache with the given capacity.
-func NewStmtCache(capacity int) *StmtCache {
-	return &StmtCache{
+// newStmtCache creates a new stmtCache with the given capacity.
+func newStmtCache(capacity int) *stmtCache {
+	return &stmtCache{
 		capacity: capacity,
 		btree: btree.NewBTreeGOptions(cacheEntryLess, btree.Options{
 			NoLocks: true,
@@ -54,7 +81,7 @@ func NewStmtCache(capacity int) *StmtCache {
 
 // Put adds a new entry to the cache. If the cache exceeds its capacity, the
 // least recently used entry is evicted.
-func (c *StmtCache) Put(query string, stmt *Stmt) {
+func (c *stmtCache) Put(query string, stmt *Stmt) {
 	// Normalize the query for consistent caching.
 	normalizedQuery := normalizeQuery(query)
 
@@ -88,7 +115,7 @@ func (c *StmtCache) Put(query string, stmt *Stmt) {
 // TryGet retrieves an entry from the cache based on the query. If the entry is
 // found, it is moved to the front of the list (most recently used) and returned.
 // If the entry is not found, nil is returned.
-func (c *StmtCache) TryGet(query string) (*Stmt, int) {
+func (c *stmtCache) TryGet(query string) (*Stmt, int) {
 	// Normalize the query for consistent caching.
 	normalizedQuery := normalizeQuery(query)
 
@@ -125,7 +152,17 @@ func (c *StmtCache) TryGet(query string) (*Stmt, int) {
 	return nil, 0
 }
 
-func (c *StmtCache) moveToFront(entry *cacheEntry) {
+// Close releases all resources associated with the cache. It closes all cached
+// statements and clears the cache.
+func (c *stmtCache) Close() {
+	c.btree.Scan(func(item *cacheEntry) bool {
+		_ = item.stmt.Close()
+		return true
+	})
+	c.btree.Clear()
+}
+
+func (c *stmtCache) moveToFront(entry *cacheEntry) {
 	if c.head == entry {
 		// Already at the front.
 		return
@@ -136,7 +173,7 @@ func (c *StmtCache) moveToFront(entry *cacheEntry) {
 }
 
 // removeFromList removes an entry from the doubly linked list.
-func (c *StmtCache) removeFromList(entry *cacheEntry) {
+func (c *stmtCache) removeFromList(entry *cacheEntry) {
 	if entry.prev != nil {
 		entry.prev.next = entry.next
 	} else {
@@ -151,7 +188,7 @@ func (c *StmtCache) removeFromList(entry *cacheEntry) {
 }
 
 // addToFront adds an entry to the front of the doubly linked list.
-func (c *StmtCache) addToFront(entry *cacheEntry) {
+func (c *stmtCache) addToFront(entry *cacheEntry) {
 	entry.next = c.head
 	entry.prev = nil
 
@@ -168,7 +205,7 @@ func (c *StmtCache) addToFront(entry *cacheEntry) {
 // evict removes the least recently used entry from the cache and decrements its
 // reference count. If the reference count reaches zero, the statement is
 // closed.
-func (c *StmtCache) evict() {
+func (c *stmtCache) evict() {
 	if c.tail == nil {
 		return
 	}
