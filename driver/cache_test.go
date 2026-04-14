@@ -539,3 +539,115 @@ func TestStmtCache_LongestPrefix(t *testing.T) {
 		t.Errorf("Expected length 7, got %d", length)
 	}
 }
+
+func TestStmtCache_PutExistingEntryMovesToFront(t *testing.T) {
+	cache := NewStmtCache(2)
+
+	stmt1 := &Stmt{}
+	stmt2 := &Stmt{}
+	stmt3 := &Stmt{}
+	duplicateStmt := &Stmt{}
+
+	cache.Put("QUERY1", stmt1)
+	cache.Put("QUERY2", stmt2)
+
+	// Re-put QUERY1 with leading whitespace and a different statement pointer:
+	// the existing entry should be kept and moved to the front.
+	cache.Put("   QUERY1", duplicateStmt)
+
+	if stmt1.refCount != 1 {
+		t.Errorf("Expected original statement refCount to remain 1, got %d", stmt1.refCount)
+	}
+	if duplicateStmt.refCount != 0 {
+		t.Errorf("Expected duplicate statement refCount to remain 0, got %d", duplicateStmt.refCount)
+	}
+
+	cache.Put("QUERY3", stmt3)
+
+	if s, l := cache.TryGet("QUERY1"); s != stmt1 || l != 6 {
+		t.Errorf("Expected QUERY1 to still be cached and mapped to the original stmt")
+	}
+	if s, l := cache.TryGet("QUERY2"); s != nil || l != 0 {
+		t.Errorf("Expected QUERY2 to be evicted after QUERY1 was refreshed")
+	}
+	if s, l := cache.TryGet("QUERY3"); s != stmt3 || l != 6 {
+		t.Errorf("Expected QUERY3 to be cached")
+	}
+}
+
+func TestStmtCache_EvictEdgeCases(t *testing.T) {
+	cache := NewStmtCache(1)
+
+	// Empty cache eviction should be a no-op.
+	cache.evict()
+
+	stmt := &Stmt{}
+	cache.Put("ONLY_QUERY", stmt)
+	cache.evict()
+
+	if cache.head != nil || cache.tail != nil {
+		t.Errorf("Expected linked list to be empty after evicting the only entry")
+	}
+	if cache.btree.Len() != 0 {
+		t.Errorf("Expected btree to be empty after evicting the only entry")
+	}
+	if stmt.refCount != 0 {
+		t.Errorf("Expected stmt refCount to be 0 after eviction, got %d", stmt.refCount)
+	}
+}
+
+func TestStmtCache_MultilineQuery(t *testing.T) {
+	cache := NewStmtCache(10)
+	stmt := &Stmt{}
+
+	multilineQuery := "SELECT id,\n       name\nFROM users\nWHERE id = ?"
+	cache.Put(multilineQuery, stmt)
+
+	tests := []struct {
+		name     string
+		query    string
+		wantStmt *Stmt
+		wantLen  int
+	}{
+		{
+			name:     "exact multiline match",
+			query:    multilineQuery,
+			wantStmt: stmt,
+			wantLen:  len(multilineQuery),
+		},
+		{
+			name:     "multiline with leading whitespace",
+			query:    "\n\t  " + multilineQuery,
+			wantStmt: stmt,
+			wantLen:  len("\n\t  " + multilineQuery),
+		},
+		{
+			name:     "multiline with semicolon and another statement",
+			query:    multilineQuery + ";\nSELECT 1",
+			wantStmt: stmt,
+			wantLen:  len(multilineQuery) + 1,
+		},
+		{
+			// Even though the content is the same, the internal spacing is
+			// different, so it should not match. Potentially we could normalize
+			// internal whitespace in the future to allow this, but for now it
+			// should fail.
+			name:     "multiline mismatch in internal spacing",
+			query:    "SELECT id,\n  name\nFROM users\nWHERE id = ?",
+			wantStmt: nil,
+			wantLen:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotStmt, gotLen := cache.TryGet(tt.query)
+			if gotStmt != tt.wantStmt {
+				t.Errorf("TryGet() gotStmt = %v, want %v", gotStmt, tt.wantStmt)
+			}
+			if gotLen != tt.wantLen {
+				t.Errorf("TryGet() gotLen = %v, want %v", gotLen, tt.wantLen)
+			}
+		})
+	}
+}
