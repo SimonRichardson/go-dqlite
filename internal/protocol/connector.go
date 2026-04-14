@@ -374,19 +374,19 @@ func (c *Connector) connectAttemptOne(
 		protocol, err = Handshake(ctx, conn, version, address)
 	}
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, "", err
 	}
 
 	leader, err := askLeader(ctx, protocol)
 	if err != nil {
-		protocol.Close()
+		_ = protocol.Close()
 		return nil, "", err
 	}
 	switch leader {
 	case "":
 		// Currently this server does not know about any leader.
-		protocol.Close()
+		_ = protocol.Close()
 		return nil, "", nil
 	case address:
 		// This server is the leader, register ourselves and return.
@@ -398,13 +398,13 @@ func (c *Connector) connectAttemptOne(
 		EncodeClient(&request, c.clientID)
 
 		if err := protocol.Call(ctx, &request, &response); err != nil {
-			protocol.Close()
+			_ = protocol.Close()
 			return nil, "", err
 		}
 
 		_, err := DecodeWelcome(&response)
 		if err != nil {
-			protocol.Close()
+			_ = protocol.Close()
 			return nil, "", err
 		}
 
@@ -415,7 +415,7 @@ func (c *Connector) connectAttemptOne(
 		return protocol, "", nil
 	default:
 		// This server claims to know who the current leader is.
-		protocol.Close()
+		_ = protocol.Close()
 		return nil, leader, nil
 	}
 }
