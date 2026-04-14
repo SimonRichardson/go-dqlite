@@ -574,10 +574,25 @@ type Stmt struct {
 	log      client.LogFunc
 	sql      string // Prepared SQL, only set when tracing
 	tracing  client.LogLevel
+	refCount int32 // Reference count for cache management
 }
 
 // Close closes the statement.
 func (s *Stmt) Close() error {
+	s.refCount--
+	if s.refCount > 0 {
+		// The statement is still in use by other cached entries, so we don't
+		// actually close it yet.
+		return nil
+	} else if s.refCount < 0 {
+		return fmt.Errorf("stmt: negative reference count")
+	}
+
+	if s.request == nil || s.response == nil || s.protocol == nil {
+		// Already closed
+		return nil
+	}
+
 	protocol.EncodeFinalize(s.request, s.db, s.id)
 
 	ctx := context.Background()
