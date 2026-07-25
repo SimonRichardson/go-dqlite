@@ -114,6 +114,81 @@ func TestConn_Query(t *testing.T) {
 	assert.NoError(t, conn.Close())
 }
 
+func TestConn_StmtCache(t *testing.T) {
+	drv, cleanup := newDriver(t, dqlitedriver.WithStmtCacheCapacity(4))
+	defer cleanup()
+
+	conn, err := drv.Open("test.db")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	execer := conn.(driver.ExecerContext)
+	queryer := conn.(driver.QueryerContext)
+	ctx := context.Background()
+
+	_, err = execer.ExecContext(ctx, "CREATE TABLE test (n INT)", nil)
+	require.NoError(t, err)
+
+	insert := "INSERT INTO test(n) VALUES(?)"
+	for i := int64(1); i <= 3; i++ {
+		_, err := execer.ExecContext(ctx, insert, []driver.NamedValue{{Ordinal: 1, Value: i}})
+		require.NoError(t, err)
+	}
+
+	query := "SELECT n FROM test WHERE n = ?"
+	for i := int64(1); i <= 3; i++ {
+		rows, err := queryer.QueryContext(ctx, query, []driver.NamedValue{{Ordinal: 1, Value: i}})
+		require.NoError(t, err)
+		values := make([]driver.Value, 1)
+		require.NoError(t, rows.Next(values))
+		assert.Equal(t, i, values[0])
+		require.NoError(t, rows.Close())
+	}
+
+	// Compound SQL must keep using the existing direct execution path. The
+	// first execution probes prepare-v1, learns that there is a remainder,
+	// and records the query as uncacheable for later calls.
+	compound := "INSERT INTO test(n) VALUES(?); INSERT INTO test(n) VALUES(?)"
+	for i := int64(0); i < 3; i++ {
+		args := []driver.NamedValue{
+			{Ordinal: 1, Value: 10 + i*2},
+			{Ordinal: 2, Value: 11 + i*2},
+		}
+		_, err := execer.ExecContext(ctx, compound, args)
+		require.NoError(t, err)
+	}
+}
+
+func TestConn_StmtCacheEviction(t *testing.T) {
+	drv, cleanup := newDriver(t, dqlitedriver.WithStmtCacheCapacity(1))
+	defer cleanup()
+
+	conn, err := drv.Open("test.db")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	execer := conn.(driver.ExecerContext)
+	ctx := context.Background()
+	_, err = execer.ExecContext(ctx, "CREATE TABLE test (n INT)", nil)
+	require.NoError(t, err)
+
+	queries := []string{
+		"INSERT INTO test(n) VALUES(?)",
+		"INSERT INTO test(n) SELECT ?",
+		"INSERT INTO test(n) VALUES(?)",
+	}
+	value := int64(1)
+	for _, query := range queries {
+		// The first call prepares the query and evicts the previously cached
+		// statement. Returning to the first query exercises re-preparation.
+		for i := 0; i < 2; i++ {
+			_, err := execer.ExecContext(ctx, query, []driver.NamedValue{{Ordinal: 1, Value: value}})
+			require.NoError(t, err)
+			value++
+		}
+	}
+}
+
 func TestConn_QueryRow(t *testing.T) {
 	drv, cleanup := newDriver(t)
 	defer cleanup()
@@ -680,7 +755,7 @@ func Test_Dump(t *testing.T) {
 
 const bindAddress = "@1"
 
-func newDriver(t *testing.T) (*dqlitedriver.Driver, func()) {
+func newDriver(t *testing.T, options ...dqlitedriver.Option) (*dqlitedriver.Driver, func()) {
 	t.Helper()
 
 	dir, dirCleanup := newDir(t)
@@ -690,7 +765,8 @@ func newDriver(t *testing.T) (*dqlitedriver.Driver, func()) {
 
 	log := logging.Test(t)
 
-	driver, err := dqlitedriver.New(store, dqlitedriver.WithLogFunc(log))
+	options = append(options, dqlitedriver.WithLogFunc(log))
+	driver, err := dqlitedriver.New(store, options...)
 	require.NoError(t, err)
 
 	cleanup := func() {

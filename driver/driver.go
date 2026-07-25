@@ -22,6 +22,7 @@ import (
 	"math"
 	"net"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,6 +43,7 @@ type Driver struct {
 	clientConfig          protocol.Config  // Configuration for dqlite client instances
 	tracing               client.LogLevel  // Whether to trace statements
 	concurrentLeaderConns *int64           // Maximum number of concurrent connections to other cluster members while probing for leadership.
+	stmtCacheCapacity     int              // Maximum cached or observed statements per connection.
 }
 
 // Error is returned in case of database errors.
@@ -189,6 +191,18 @@ func WithTracing(level client.LogLevel) Option {
 	}
 }
 
+// WithStmtCacheCapacity sets the maximum number of prepared statements retained
+// by each connection. Single-statement queries are prepared on their first
+// execution and reused while they remain in the per-connection LRU cache.
+//
+// A capacity of zero disables automatic statement caching. The cache is
+// disabled by default.
+func WithStmtCacheCapacity(capacity int) Option {
+	return func(options *options) {
+		options.StmtCacheCapacity = capacity
+	}
+}
+
 // New creates a new dqlite driver, which also implements the
 // driver.Driver interface.
 func New(store client.NodeStore, options ...Option) (*Driver, error) {
@@ -196,6 +210,9 @@ func New(store client.NodeStore, options ...Option) (*Driver, error) {
 
 	for _, option := range options {
 		option(o)
+	}
+	if o.StmtCacheCapacity < 0 {
+		return nil, fmt.Errorf("statement cache capacity must not be negative")
 	}
 
 	driver := &Driver{
@@ -206,6 +223,7 @@ func New(store client.NodeStore, options ...Option) (*Driver, error) {
 		contextTimeout:        o.ContextTimeout,
 		tracing:               o.Tracing,
 		concurrentLeaderConns: o.ConcurrentLeaderConns,
+		stmtCacheCapacity:     o.StmtCacheCapacity,
 		clientConfig: protocol.Config{
 			Dial:           o.Dial,
 			AttemptTimeout: o.AttemptTimeout,
@@ -231,6 +249,7 @@ type options struct {
 	RetryLimit              uint
 	Context                 context.Context
 	Tracing                 client.LogLevel
+	StmtCacheCapacity       int
 }
 
 // Create a options object with sane defaults.
@@ -268,6 +287,7 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 		log:            c.driver.log,
 		contextTimeout: c.driver.contextTimeout,
 		tracing:        c.driver.tracing,
+		stmtCache:      newStmtCache(c.driver.stmtCacheCapacity),
 	}
 
 	proto, err := c.protocol.Connect(ctx)
@@ -351,6 +371,83 @@ type Conn struct {
 	id             uint32 // Database ID.
 	contextTimeout time.Duration
 	tracing        client.LogLevel
+	stmtCache      *stmtCache
+}
+
+// prepareCachedStatement prepares a statement using protocol version 1 so the
+// server tells us exactly how much SQL it consumed. Only a query containing one
+// statement is eligible for caching; compound SQL retains the existing direct
+// execution semantics.
+func (c *Conn) prepareCachedStatement(ctx context.Context, query string) (*Stmt, bool, error) {
+	stmt := &Stmt{
+		protocol: c.protocol,
+		request:  &c.request,
+		response: &c.response,
+		log:      c.log,
+		tracing:  c.tracing,
+	}
+
+	protocol.EncodePrepareV1(&c.request, uint64(c.id), query)
+
+	var start time.Time
+	if c.tracing != client.LogNone {
+		start = time.Now()
+	}
+	err := c.protocol.Call(ctx, &c.request, &c.response)
+	if c.tracing != client.LogNone {
+		c.log(c.tracing, "%.3fs request prepared for cache: %q", time.Since(start).Seconds(), query)
+	}
+	if err != nil {
+		return nil, false, driverError(c.log, err)
+	}
+
+	var offset uint64
+	stmt.db, stmt.id, stmt.params, offset, err = protocol.DecodeStmtWithOffset(&c.response)
+	if err != nil {
+		return nil, false, driverError(c.log, err)
+	}
+	if offset == 0 || offset > uint64(len(query)) {
+		_ = stmt.Close()
+		return nil, false, fmt.Errorf("dqlite: invalid prepared statement offset %d for query of length %d", offset, len(query))
+	}
+
+	if c.tracing != client.LogNone {
+		stmt.sql = query[:offset]
+	}
+
+	if strings.Trim(query[offset:], " \t\n\v\f\r") != "" {
+		_ = stmt.Close()
+		return nil, false, nil
+	}
+
+	return stmt, true, nil
+}
+
+// cachedStatement returns a reusable prepared statement for query. A miss is
+// prepared immediately and inserted into the bounded per-connection cache.
+func (c *Conn) cachedStatement(ctx context.Context, query string) (*Stmt, error) {
+	stmt, found := c.stmtCache.lookup(query)
+	if found {
+		return stmt, nil
+	}
+
+	stmt, cacheable, err := c.prepareCachedStatement(ctx, query)
+	if err != nil {
+		if err == driver.ErrBadConn || ctx.Err() != nil {
+			return nil, err
+		}
+		// Preserve the behavior and error produced by the direct execution
+		// path for SQL that cannot currently be prepared. Do not negatively
+		// cache the failure: a later schema change may make it preparable.
+		return nil, nil
+	}
+	if !cacheable {
+		c.stmtCache.reject(query)
+		return nil, nil
+	}
+
+	c.stmtCache.store(query, stmt)
+	return stmt, nil
 }
 
 // PrepareContext returns a prepared statement, bound to this connection.
@@ -404,6 +501,17 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	ctx, span := tracing.Start(ctx, "dqlite.driver.ExecContext", query)
 	defer span.End()
 
+	stmt, err := c.cachedStatement(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if stmt != nil {
+		if stmt.NumInput() != len(args) {
+			return nil, driverError(c.log, fmt.Errorf("expected %d arguments, got %d", stmt.NumInput(), len(args)))
+		}
+		return stmt.ExecContext(ctx, args)
+	}
+
 	if int64(len(args)) > math.MaxUint32 {
 		return nil, driverError(c.log, fmt.Errorf("too many parameters (%d)", len(args)))
 	} else if len(args) > math.MaxUint8 {
@@ -416,7 +524,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if c.tracing != client.LogNone {
 		start = time.Now()
 	}
-	err := c.protocol.Call(ctx, &c.request, &c.response)
+	err = c.protocol.Call(ctx, &c.request, &c.response)
 	if c.tracing != client.LogNone {
 		c.log(c.tracing, "%.3fs request exec: %q", time.Since(start).Seconds(), query)
 	}
@@ -443,6 +551,17 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	ctx, span := tracing.Start(ctx, "dqlite.driver.QueryContext", query)
 	defer span.End()
 
+	stmt, err := c.cachedStatement(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if stmt != nil {
+		if stmt.NumInput() != len(args) {
+			return nil, driverError(c.log, fmt.Errorf("expected %d arguments, got %d", stmt.NumInput(), len(args)))
+		}
+		return stmt.QueryContext(ctx, args)
+	}
+
 	if int64(len(args)) > math.MaxUint32 {
 		return nil, driverError(c.log, fmt.Errorf("too many parameters (%d)", len(args)))
 	} else if len(args) > math.MaxUint8 {
@@ -455,7 +574,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if c.tracing != client.LogNone {
 		start = time.Now()
 	}
-	err := c.protocol.Call(ctx, &c.request, &c.response)
+	err = c.protocol.Call(ctx, &c.request, &c.response)
 	if c.tracing != client.LogNone {
 		c.log(c.tracing, "%.3fs request query: %q", time.Since(start).Seconds(), query)
 	}
@@ -491,6 +610,7 @@ func (c *Conn) Exec(query string, args []driver.Value) (driver.Result, error) {
 // Close when there's a surplus of idle connections, it shouldn't be necessary
 // for drivers to do their own connection caching.
 func (c *Conn) Close() error {
+	c.stmtCache.discard()
 	return c.protocol.Close()
 }
 

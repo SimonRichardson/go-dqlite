@@ -304,8 +304,12 @@ func TestOptions(t *testing.T) {
 		driver.WithConnectionBackoffCap(1*time.Second),
 		driver.WithAttemptTimeout(5*time.Second),
 		driver.WithRetryLimit(0),
+		driver.WithStmtCacheCapacity(16),
 	)
 	require.NoError(t, err)
+
+	_, err = driver.New(store, driver.WithStmtCacheCapacity(-1))
+	require.EqualError(t, err, "statement cache capacity must not be negative")
 }
 
 func newDB(t *testing.T, n int) (*sql.DB, []*nodeHelper, func()) {
