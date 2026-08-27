@@ -22,6 +22,9 @@ import (
 	"math"
 	"net"
 	"reflect"
+	"regexp"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -268,6 +271,8 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 		log:            c.driver.log,
 		contextTimeout: c.driver.contextTimeout,
 		tracing:        c.driver.tracing,
+
+		preparedStmts: make(map[string]*Stmt),
 	}
 
 	proto, err := c.protocol.Connect(ctx)
@@ -351,14 +356,33 @@ type Conn struct {
 	id             uint32 // Database ID.
 	contextTimeout time.Duration
 	tracing        client.LogLevel
+
+	mutex         sync.Mutex
+	preparedStmts map[string]*Stmt
 }
 
 // PrepareContext returns a prepared statement, bound to this connection.
 // context is for the preparation of the statement, it must not store the
 // context within the statement itself.
 func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
-	ctx, span := tracing.Start(ctx, "dqlite.driver.PrepareContext", query)
+	return c.prepare(ctx, query)
+}
+
+// Prepare returns a prepared statement, bound to this connection.
+func (c *Conn) Prepare(query string) (driver.Stmt, error) {
+	return c.PrepareContext(context.Background(), query)
+}
+
+func (c *Conn) prepare(ctx context.Context, query string) (*Stmt, error) {
+	ctx, span := tracing.Start(ctx, "dqlite.driver.prepare", query)
 	defer span.End()
+
+	c.mutex.Lock()
+	if stmt, ok := c.preparedStmts[query]; ok {
+		c.mutex.Unlock()
+		return stmt, nil
+	}
+	c.mutex.Unlock()
 
 	stmt := &Stmt{
 		protocol: c.protocol,
@@ -391,46 +415,56 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 		stmt.sql = query
 	}
 
+	c.mutex.Lock()
+	c.preparedStmts[query] = stmt
+	c.mutex.Unlock()
+
 	return stmt, nil
 }
 
-// Prepare returns a prepared statement, bound to this connection.
-func (c *Conn) Prepare(query string) (driver.Stmt, error) {
-	return c.PrepareContext(context.Background(), query)
-}
+var r = regexp.MustCompile("BEGIN|COMMIT|ROLLBACK|CREATE TABLE|CREATE VIEW|PRAGMA")
 
 // ExecContext is an optional interface that may be implemented by a Conn.
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	ctx, span := tracing.Start(ctx, "dqlite.driver.ExecContext", query)
 	defer span.End()
 
-	if int64(len(args)) > math.MaxUint32 {
-		return nil, driverError(c.log, fmt.Errorf("too many parameters (%d)", len(args)))
-	} else if len(args) > math.MaxUint8 {
-		protocol.EncodeExecSQLV1(&c.request, uint64(c.id), query, args)
-	} else {
-		protocol.EncodeExecSQLV0(&c.request, uint64(c.id), query, args)
+	if r.MatchString(strings.ToUpper(query)) {
+		if int64(len(args)) > math.MaxUint32 {
+			return nil, driverError(c.log, fmt.Errorf("too many parameters (%d)", len(args)))
+		} else if len(args) > math.MaxUint8 {
+			protocol.EncodeExecSQLV1(&c.request, uint64(c.id), query, args)
+		} else {
+			protocol.EncodeExecSQLV0(&c.request, uint64(c.id), query, args)
+		}
+
+		var start time.Time
+		if c.tracing != client.LogNone {
+			start = time.Now()
+		}
+		err := c.protocol.Call(ctx, &c.request, &c.response)
+		if c.tracing != client.LogNone {
+			c.log(c.tracing, "%.3fs request exec: %q", time.Since(start).Seconds(), query)
+		}
+		if err != nil {
+			return nil, driverError(c.log, err)
+		}
+
+		var result protocol.Result
+		result, err = protocol.DecodeResult(&c.response)
+		if err != nil {
+			return nil, driverError(c.log, err)
+		}
+
+		return &Result{result: result}, nil
 	}
 
-	var start time.Time
-	if c.tracing != client.LogNone {
-		start = time.Now()
-	}
-	err := c.protocol.Call(ctx, &c.request, &c.response)
-	if c.tracing != client.LogNone {
-		c.log(c.tracing, "%.3fs request exec: %q", time.Since(start).Seconds(), query)
-	}
+	stmt, err := c.prepare(ctx, query)
 	if err != nil {
-		return nil, driverError(c.log, err)
+		return nil, err
 	}
 
-	var result protocol.Result
-	result, err = protocol.DecodeResult(&c.response)
-	if err != nil {
-		return nil, driverError(c.log, err)
-	}
-
-	return &Result{result: result}, nil
+	return stmt.ExecContext(ctx, args)
 }
 
 // Query is an optional interface that may be implemented by a Conn.
@@ -443,40 +477,12 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	ctx, span := tracing.Start(ctx, "dqlite.driver.QueryContext", query)
 	defer span.End()
 
-	if int64(len(args)) > math.MaxUint32 {
-		return nil, driverError(c.log, fmt.Errorf("too many parameters (%d)", len(args)))
-	} else if len(args) > math.MaxUint8 {
-		protocol.EncodeQuerySQLV1(&c.request, uint64(c.id), query, args)
-	} else {
-		protocol.EncodeQuerySQLV0(&c.request, uint64(c.id), query, args)
-	}
-
-	var start time.Time
-	if c.tracing != client.LogNone {
-		start = time.Now()
-	}
-	err := c.protocol.Call(ctx, &c.request, &c.response)
-	if c.tracing != client.LogNone {
-		c.log(c.tracing, "%.3fs request query: %q", time.Since(start).Seconds(), query)
-	}
+	stmt, err := c.prepare(ctx, query)
 	if err != nil {
-		return nil, driverError(c.log, err)
+		return nil, err
 	}
 
-	var rows protocol.Rows
-	rows, err = protocol.DecodeRows(&c.response)
-	if err != nil {
-		return nil, driverError(c.log, err)
-	}
-
-	return &Rows{
-		ctx:      ctx,
-		request:  &c.request,
-		response: &c.response,
-		protocol: c.protocol,
-		rows:     rows,
-		log:      c.log,
-	}, nil
+	return stmt.QueryContext(ctx, args)
 }
 
 // Exec is an optional interface that may be implemented by a Conn.
@@ -491,6 +497,9 @@ func (c *Conn) Exec(query string, args []driver.Value) (driver.Result, error) {
 // Close when there's a surplus of idle connections, it shouldn't be necessary
 // for drivers to do their own connection caching.
 func (c *Conn) Close() error {
+	for _, stmt := range c.preparedStmts {
+		stmt.Close()
+	}
 	return c.protocol.Close()
 }
 
